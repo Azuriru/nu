@@ -1,0 +1,65 @@
+Windows Registry Editor Version 5.00
+
+; Will %USERPROFILE% work? Maybe.
+[HKEY_CLASSES_ROOT\Directory\Background\shell\Nushell]
+@="Open with Nushell"
+"Icon"="C:\\Users\\Doru\\.cargo\\bin\\nu.exe"
+
+[HKEY_CLASSES_ROOT\Directory\Background\shell\Nushell\command]
+@="C:\\Users\\Doru\\.cargo\\bin\\nu.exe"
+
+; Video tool definitions
+; MultiSelectModel doesn't seem to work. Sad! We have a limit of 15 document, split-spawning tasks
+[HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Explorer\CommandStore\Shell\DoruVid.cut]
+@="Cut video"
+"MultiSelectModel"="Player"
+
+[HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Explorer\CommandStore\Shell\DoruVid.cut\command]
+@="\"C:\\Users\\Doru\\.config\\nushell\\files\\cut.bat\" \"%1\""
+
+[HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Explorer\CommandStore\Shell\DoruVid.cutAv1]
+@="Cut video AV1"
+"MultiSelectModel"="Player"
+
+[HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Explorer\CommandStore\Shell\DoruVid.cutAv1\command]
+@="\"C:\\Users\\Doru\\.config\\nushell\\files\\cutav1.bat\" \"%1\""
+
+[HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Explorer\CommandStore\Shell\DoruVid.plot]
+@="Plot bitrate"
+"MultiSelectModel"="Player"
+
+[HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Explorer\CommandStore\Shell\DoruVid.plot\command]
+@="\"C:\\Users\\Doru\\.config\\nushell\\files\\plot.bat\" \"%1\""
+
+[HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Explorer\CommandStore\Shell\DoruVid.togif]
+@="To gif"
+"MultiSelectModel"="Player"
+
+[HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Explorer\CommandStore\Shell\DoruVid.togif\command]
+@="\"C:\\Users\\Doru\\.config\\nushell\\files\\togif.bat\" \"%1\""
+
+; Video tool associations
+[HKEY_CLASSES_ROOT\VLC.mp4\shell\DoruVid]
+"MUIVerb"="Vid tools"
+"Icon"="C:\\Users\\Doru\\.cargo\\bin\\nu.exe"
+"SubCommands"="DoruVid.cut;DoruVid.cutAv1;DoruVid.plot;DoruVid.togif"
+
+[HKEY_CLASSES_ROOT\VLC.mkv\shell\DoruVid]
+"MUIVerb"="Vid tools"
+"Icon"="C:\\Users\\Doru\\.cargo\\bin\\nu.exe"
+"SubCommands"="DoruVid.cut;DoruVid.cutAv1;DoruVid.plot;DoruVid.togif"
+
+[HKEY_CLASSES_ROOT\VLC.webm\shell\DoruVid]
+"MUIVerb"="Vid tools"
+"Icon"="C:\\Users\\Doru\\.cargo\\bin\\nu.exe"
+"SubCommands"="DoruVid.cut;DoruVid.cutAv1;DoruVid.plot;DoruVid.togif"
+
+[HKEY_CLASSES_ROOT\VLC.avi\shell\DoruVid]
+"MUIVerb"="Vid tools"
+"Icon"="C:\\Users\\Doru\\.cargo\\bin\\nu.exe"
+"SubCommands"="DoruVid.cut;DoruVid.cutAv1;DoruVid.plot;DoruVid.togif"
+
+[HKEY_CLASSES_ROOT\VLC.mov\shell\DoruVid]
+"MUIVerb"="Vid tools"
+"Icon"="C:\\Users\\Doru\\.cargo\\bin\\nu.exe"
+"SubCommands"="DoruVid.cut;DoruVid.cutAv1;DoruVid.plot;DoruVid.togif"
