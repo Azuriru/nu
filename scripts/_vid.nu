@@ -4,14 +4,16 @@ use _term.nu *
 use _mutex.nu *
 use _ssh.nu *
 use _path.nu *
+use _str.nu *
 
 const NANOSECONDS_IN_SECOND = 1000000000
 
 export def 'vid get-streams' [
     file_path: path
+    ...xargs
 ] {
     let ffprobe_results = do {
-        let res = ffprobe -v error -show_entries 'format:stream' $file_path | complete
+        let res = ffprobe -v error -show_entries 'format:stream' ...$xargs $file_path | complete
 
         echo $res
 
@@ -33,8 +35,9 @@ export def 'vid get-streams' [
 
 export def 'vid get-meta' [
     file_path: path
+    ...xargs
 ] {
-    let streams = vid get-streams $file_path
+    let streams = vid get-streams $file_path ...$xargs
     let format = $streams | where section_name == FORMAT | first | get props
     let video = $streams | where section_name == STREAM and props.codec_type == video | get 0?.props
     let dimensions = $streams | where { |r|
@@ -42,8 +45,8 @@ export def 'vid get-meta' [
     } | get 0?.props
 
     $format | select duration size bit_rate
-        | upsert duration { into float | $in * 1sec }
-        | upsert bit_rate { into filesize }
+        | upsert duration { try { into float | $in * 1sec } catch { null } }
+        | upsert bit_rate { try { into filesize } catch { null } }
         | upsert size { into filesize }
         | then $dimensions { |dims|
             insert height ($dims.height | into int)
@@ -54,13 +57,19 @@ export def 'vid get-meta' [
             insert vcodec $v.codec_name
             | insert frames { |r|
                 try {
-                    $v.nb_frames | into int
-                } catch {
-                    # approximate
-                    $r.duration / 1sec * 30 | math floor
+                    return ($v.nb_frames | into int)
                 }
+                try {
+                    return ($v.nb_read_frames | into int)
+                }
+                try {
+                    # guesstimate
+                    return ($r.duration / 1sec * 30 | math floor)
+                }
+
+                null
             }
-            | insert fps { |r| $r.frames / ($r.duration / 1sec) }
+            | insert fps { |r| try { $r.frames / ($r.duration / 1sec) } }
             | insert fps_ratio ($v.r_frame_rate | split row '/')
         }
 }
@@ -106,27 +115,39 @@ export def 'vid size-report' [
 export def 'vid get-default-scaling' [
     path: path,
     --max: int = 1080
+    # -2 to scale to multiples of 2 for derived aspect ratio resolution
+    # Used to return null, -2 is more convenient, and always defaulted to that
+    # Keep this file clean if returned to null
+    --dominant-sentinel = -2
+    --expand
 ] {
     let meta = vid get-meta $path
-    let max_height = if $meta.width >= $meta.height {
+    mut max_height = if $meta.width >= $meta.height {
         [$meta.height, $max] | math min
     } else {
-        # -2 to scale to multiples of 2 for derived aspect ratio resolution
-        # Used to return null, -2 is more convenient, and always defaulted to that
-        # Keep this file clean if returned to null
-        -2
+        $dominant_sentinel
     }
-    let max_width = if $meta.height > $meta.width {
+    mut max_width = if $meta.height > $meta.width {
         [$meta.width, $max] | math min
     } else {
-        -2
+        $dominant_sentinel
     }
 
-    # print $"max-h: ($max_height) max-w: ($max_width)"
+    if $expand {
+        if $max_height == $dominant_sentinel {
+            $max_height = $max_width * $meta.height / $meta.width | math floor
+            $max_height += $max_height mod ($dominant_sentinel | math abs)
+        }
+
+        if $max_width == $dominant_sentinel {
+            $max_width = $max_height * $meta.width / $meta.height | math floor
+            $max_width += $max_width mod ($dominant_sentinel | math abs)
+        }
+    }
 
     {
-        max_width: $max_width,
-        max_height: $max_height
+        max_width: ($max_width | into int),
+        max_height: ($max_height | into int)
     }
 }
 
@@ -147,7 +168,11 @@ export def 'vid compare-frame' [
 export def 'vid compare-frames' [
     a: path
     ...others: path
-    --frames: int = 3000
+    --frames: int = 999999999999
+    --until: string = '10:00'
+    --searchspace: int = 3 # Increases the amount of frames extracted from `a` fast
+    --interval: int = 151
+    --format = 'jpg' # Faster and has fewer problems with weird color space shifting
 ] {
     if ($others | is-empty) {
         error make {
@@ -155,28 +180,39 @@ export def 'vid compare-frames' [
         }
     }
 
-    const FRAME_SLICE = 5
-    const RANGE_START = 0 # 0-indexed
-    const RANGE_END = $FRAME_SLICE - 1 # inclusive frame 0-indexed range for between()
-    const MIDDLE = $FRAME_SLICE / 2 | math floor # Still 0-indexed
+    let FRAME_SLICE = $searchspace * 2 + 1
+    let RANGE_START = 0
+    let RANGE_END = $FRAME_SLICE - 1
+    let MIDDLE = $FRAME_SLICE / 2 | math floor | into int
+
+    # const FRAME_SLICE = 5
+    # const RANGE_START = 0 # 0-indexed
+    # const RANGE_END = $FRAME_SLICE - 1 # inclusive frame 0-indexed range for between()
+    # const MIDDLE = $FRAME_SLICE / 2 | math floor # Still 0-indexed
+
+    rm -rf cmp
 
     mkdir cmp
 
-    let filter = "select='between(mod(n,300),$min,$max)*lt(n,$frames)',setpts=N/FRAME_RATE/TB"
-    let fa = $filter | str replace '$min' $"($RANGE_START)" | str replace '$max' $"($RANGE_END)" | str replace '$frames' $"($frames)"
-    let fb = $filter | str replace '$min' $"($MIDDLE)" | str replace '$max' $"($MIDDLE)" | str replace '$frames' $"($frames)"
-    let to = $frames / 20 # assume 24 fps baseline; read this with ffprobe later
+    # If searchspace * 2 >= $interval, every frame will be extracted from the first path
+    let filter = "select='between(mod(n,$interval),$min,$max)*lt(n,$frames)',setpts=N/FRAME_RATE/TB"
+    let fa = $filter | str replace '$min' $"($RANGE_START)" | str replace '$max' $"($RANGE_END)" | str replace '$frames' $"($frames)" | str replace '$frames' $"($frames)"
+ | str replace '$interval' $"($interval)"
+    let fb = $filter | str replace '$min' $"($MIDDLE)" | str replace '$max' $"($MIDDLE)" | str replace '$frames' $"($frames)" | str replace '$frames' $"($frames)"
+ | str replace '$interval' $"($interval)"
+    # let to = $frames / 20 # assume 24 fps baseline; read this with ffprobe later
     let chars = seq char b z
 
-    ffmpeg -ss 0 -to $to -i $a -vf $fa -fps_mode vfr cmp/a_%03d.png
-    # ffmpeg -ss 0 -to $to -i $b -vf $fb -fps_mode vfr cmp/b_%03d.png
+    ffmpeg -ss 0 -to $until -i $a -vf $fa -fps_mode vfr $"cmp/a_%03d.($format)"
+    # ffmpeg -ss 0 -to $until -i $b -vf $fb -fps_mode vfr $"cmp/b_%03d.($format)"
     for other in ($others | enumerate) {
-        ffmpeg -ss 0 -to $to -i $other.item -vf $fb -fps_mode vfr $"cmp/($chars | get $other.index)_%03d.png"
+        ffmpeg -ss 0 -to $until -i $other.item -vf $fb -fps_mode vfr $"cmp/($chars | get $other.index)_%03d.($format)"
     }
 
-    glob cmp/b_*.png | each { |path|
+    # Compare every a frame in the ranges with the b frames, then apply their jitters to c..
+    glob $'cmp/b_*.($format)' | each { |path|
         try {
-            let index = $path | parse -r '_(\d+).png' | get 0.capture0 | into int
+            let index = $path | parse -r $"_\(\\d+).($format)" | get 0.capture0 | into int
             # File naming index that starts at 1 is very annoying for the intersection math
             let index = $index - 1
 
@@ -184,7 +220,13 @@ export def 'vid compare-frames' [
             let mid = $other_start + $MIDDLE
 
             let candidates = $other_start..<($other_start + $FRAME_SLICE) | par-each -k { |n|
-                let name = $"cmp/a_($n + 1 | fill -a r -c 0 -w 3).png"
+                let name = $"cmp/a_($n + 1 | fill -a r -c 0 -w 3).($format)"
+                if not ($name | path exists) {
+                    print $"missing name: ($name)"
+
+                    return { score: 0, name: $name }
+                }
+
                 let score = (vid compare-frame $name $path) - ($n - $mid | math abs) * 0.000001
                 let score = $score | math round -p 6
 
@@ -195,23 +237,30 @@ export def 'vid compare-frames' [
 
             print -e $"Best score: ($best | get item.score | fill -a l -w 10) Worst score: ($candidates | last | get item.score | fill -a l -w 10) Jitter: ($best.index - $MIDDLE | math abs)"
 
-            cp $best.item.name $"./cmp/($index).a.png"
-            # cp $path $"./cmp/($index).($bn).png"
+            cp $best.item.name $"./cmp/($index).a.($format)"
+            # cp $path $"./cmp/($index).($bn).($format)"
             for other in ($others | enumerate) {
                 let chr = $chars | get $other.index
-                cp ($path | str replace -r 'b(?=_\d+\.)' $chr) $"./cmp/($index).($chr).png"
+                cp ($path | str replace -r 'b(?=_\d+\.)' $chr) $"./cmp/($index).($chr).($format)"
             }
         } catch { |e| print -e $e }
     }
 
-    rm cmp/?_*.png
+    rm ...(glob $'cmp/?_*.($format)')
 }
 
 export def 'vid _format-duration' [
     duration
-    --trim
-    --optmillis
+    --notrim
+    --nomillis
+    --forcemillis
+    --minsections: int = 1
 ] {
+    # Handle negatives specially because the results get weird for negative durations
+    let negative = $duration < 0sec
+    let sign = if $negative { '-' } else { '' }
+    let duration = $duration | math abs
+
     let hours = $duration / 1hr | math floor
     let duration = $duration - $hours * 1hr
     let minutes = $duration / 1min | math floor
@@ -220,20 +269,24 @@ export def 'vid _format-duration' [
     let duration = $duration - $seconds * 1sec
     let millis = $duration / 1ms | math floor
 
-    mut units = [
-        ($hours | fill -w 2 -c 0 -a r),
-        ($minutes | fill -w 2 -c 0 -a r),
-        ($seconds | fill -w 2 -c 0 -a r)
-    ] | skip while { |seg| $seg == '00' } | str join ':' | default -e '0'
+    mut hms = ([$seconds, $minutes, $hours]
+        | enumerate
+        | reverse
+        | skip while { |p| $p.item == 0 and $p.index >= $minsections }
+        | get item
+        | fill -w 2 -c 0 -a r
+        | str join ':'
+    )
 
-    if $trim {
-        $units = $units | str trim -l -c 0
+    if not $notrim {
+        # $hms = $hms | str trim -l -c '0' | default -e '0'
+        $hms = $hms | str replace -r '^0+([\d]|$)' '$1' | str replace -r '^0+([\D])' '0$1' | default -e '0'
     }
 
-    if $optmillis and $millis == 0 {
-        $"($units)"
+    if (not $forcemillis and $millis == 0) or $nomillis {
+        $"($sign)($hms)"
     } else {
-        $"($units).($millis | fill -w 3 -c 0 -a r)"
+        $"($sign)($hms).($millis | fill -w 3 -c 0 -a r)"
     }
 }
 
@@ -348,14 +401,51 @@ export def 'vid av1' [
 
     let final_stat = ls -D $target_path | first
 
+    let ret = print-encode-message $stat $final_stat $target
+
+    if $rm and $ret.saved > 0kb {
+        rm $path
+    }
+}
+
+def print-encode-message [
+    stat
+    final_stat
+    target: path
+    start?
+] {
     let saved = $stat.size - $final_stat.size
     let color = if $saved > 0kb { 'green' } else { 'red' }
     let percentage = $final_stat.size / $stat.size * 100 | math round -p 1
 
-    print $"Encoded (ansiwrap yellow_bold ($target | path basename)): final size (ansiwrap light_blue ($final_stat.size | into string)), saved (ansiwrap $color $saved), (ansiwrap light_blue $percentage)% of initial"
+    let rpath = try {
+        $target | path relative-to $env.PWD
+    } catch {
+        $target | path basename
+    }
 
-    if $rm and $saved > 0kb {
-        rm $path
+    mut message = $"Encoded (ansiwrap yellow_bold ($rpath)): final (ansiwrap light_blue ($final_stat.size | into string)), saved (ansiwrap $color $saved) \((ansiwrap light_blue $percentage)%\)"
+
+    if $start != null {
+        let elapsed = (date now) - $start
+        let h = $elapsed / 1hr | math floor
+        let m = $elapsed mod 1hr / 1min | math floor
+        let s = $elapsed mod 1min / 1sec | math floor
+        let ms = $elapsed mod 1sec / 1ms | math floor
+
+        mut time = [$h $m $s] | skip while { |seg| $seg == 0 } | fill -a r -c 0 -w 2 | str join ":" | str trim -l -c 0 | default '0'
+
+        if $ms > 0 {
+            $time += $".($ms | fill -a r -c 0 -w 3)"
+        }
+
+        $message += $" in ($time)"
+    }
+
+    print $message
+
+    return {
+        saved: $saved
     }
 }
 
@@ -365,25 +455,383 @@ export def yuv-pipe [
     --start: string = "0"
     --end: string = "10000000"
     --fps: int
+    # --format = "yuv420p" # or yuv420p10le for 10bit
+    --10bit
+    --nostats
+    --noaccel
 ] {
-    mut video_filter = $"scale=($scale.max_width):($scale.max_height)"
+    mut video_filter = if not $noaccel {
+        if $10bit {
+            $"scale_cuda=($scale.max_width):($scale.max_height):format=p010le:interp_algo=lanczos,hwdownload,format=p010le"
+        } else {
+            # Without format step, can fail on some videos with error "Invalid output format monow"
+            $"scale_cuda=($scale.max_width):($scale.max_height):format=yuv420p:interp_algo=lanczos,hwdownload,format=yuv420p"
+        }
+    } else {
+        $"scale=($scale.max_width):($scale.max_height)"
+    }
+
     if $fps != null {
         $video_filter += $",fps=($fps)"
     }
+
     (ffmpeg
+        ...(if not $noaccel { [
+            -hwaccel cuda
+            # Fixing cuda output format enables most of the speedup, need to hwdownload at the end
+            -hwaccel_output_format cuda
+            # Pin threads with hardware acceleration
+            # Why? The goal is to reduce CPU time, but more importantly, nvdec can fail
+            # with some videos (which - idk, but they fail consistently, even some 480p ones)
+            # "Using more than 32 (35) decode surfaces might cause nvdec to fail."
+            # Fixing a low amount of threads won't slow anything down and stops this
+            -threads 4
+        ] } else { })
         -v warning
-        -stats
+        ...(if not $nostats { [-stats] } else { [] })
         # TODO: Do like with vcut an option to put the -to to a -t after the -i for some compat issues
         ...(if $start != "0" or $end != "10000000" { [-ss $start -to $end] } else { [] })
         -i $path
         -map 0:v:0
         -vf $video_filter
-        -pix_fmt yuv420p
+        -pix_fmt (if $10bit { 'yuv420p10le' } else { 'yuv420p' })
         -f yuv4mpegpipe
         -strict -1
         -an
         -
     )
+}
+
+export def _yuv-split-test [
+    filename: string
+    callback: closure
+    --mod: int = 2
+    --endframe = 20
+    --workers: int
+] {
+    let meta = vid get-meta $filename
+    # yuv420 stores w*h luma, plus a quarter of that chroma for u/v
+    let frame_byte_length = $meta.width * $meta.height * 3 / 2 | into int
+
+    let status = {
+        kind: 'started',
+        bytez: 0x[]
+    }
+
+    let worker_count = if $workers == null {
+        # Assume hyperthreading since -l doesn't provide EfficiencyClass for hyperthreading/p-e core cpus
+        # (sys cpu | length) / 2 | into int
+        sys cpu | length
+    } else {
+        $workers
+    }
+
+    let db_path = mktemp -t --suffix .db
+    rm $db_path
+    sqlite init $db_path [
+        "PRAGMA synchronous=OFF",
+        "CREATE TABLE IF NOT EXISTS broadcaster_table (worker INTEGER, frame BLOB)"
+    ]
+
+    let frame_tag = random int
+    let availability_tag = random int
+    let parent_id = job id
+
+    let workers = 0..<$worker_count | each {
+        job spawn {
+            loop {
+                let payload = job recv
+
+                let ftag = $frame_tag
+
+                match $payload.tag {
+                    $tag if $tag == $availability_tag => {
+                        let response = {
+                            loopback: (job id)
+                        }
+
+                        $response | job send $payload.loopback --tag $availability_tag
+                    },
+                    $tag if $tag == $ftag => {
+                        # let results = open $db_path | query db "SELECT frame FROM broadcaster_table WHERE worker = ?" -p [(job id)]
+                        # let count = $results | length
+                        # let frames = $results | get frame | bytes collect
+
+                        # # print $"working at (job id) for ($payload.count) \(($count)) with ($frames | length) bytes"
+
+                        # let result = $frames | do $callback
+
+                        # $result | job send $parent_id --tag $frame_tag
+                        let payload = {
+                            worker: (job id),
+                            getframes: { ||
+                                open $db_path | query db "SELECT frame FROM broadcaster_table WHERE worker = ?" -p [(job id)] | get frame | bytes collect
+                            },
+                            index: $payload.index,
+                            count: $payload.count
+                        }
+
+
+                        let result = $payload | do $callback
+
+                        open $db_path | query db "DELETE FROM broadcaster_table WHERE worker = ?" -p [(job id)]
+
+                        $result | job send $parent_id --tag $frame_tag
+                    },
+                    $tag => {}
+                }
+            }
+        }
+    }
+
+    let broadcaster = job spawn {
+        mut task_index = 0
+        mut frames = {
+            count: 0
+        }
+
+        loop {
+            loop {
+                # Clear mailbox
+                try {
+                    job recv --tag $availability_tag --timeout 0sec
+                } catch {
+                    break
+                }
+            }
+
+            let frame = job recv --tag $frame_tag
+
+            if $frame != 0x[] {
+                let starty = date now
+                open $db_path | query db "INSERT INTO broadcaster_table (worker, frame) VALUES (?, ?)" -p [null, $frame]
+                # print (open $db_path | query db "SELECT COUNT(*) as cont FROM broadcaster_table" | get cont.0)
+
+                $frames.count += 1
+
+                # print ((date now) - $starty)
+            }
+
+            if $frames.count == $mod or ($frame == 0x[] and $frames.count != 0) {
+                for worker in $workers {
+                    let payload = {
+                        count: $frames.count,
+                        index: $task_index,
+                        tag: $availability_tag,
+                        loopback: (job id)
+                    }
+
+                    $payload | job send $worker --tag $availability_tag
+                }
+
+                let response = job recv --tag $availability_tag
+
+                # print $"available worker ($response.loopback)"
+
+                let starty = date now
+
+                open $db_path | query db "UPDATE broadcaster_table SET worker = ? WHERE worker IS NULL" -p [$response.loopback]
+
+                # print ((date now) - $starty)
+
+                let payload = {
+                    count: $frames.count,
+                    tag: $frame_tag,
+                    index: $task_index,
+                    frames: $frames,
+                    loopback: (job id)
+                }
+
+                $payload | job send $response.loopback --tag $frame_tag
+
+                $task_index += 1
+                $frames.count = 0
+            }
+
+            if $frame == 0x[] {
+                1 | job send $parent_id --tag $availability_tag
+            }
+        }
+    }
+
+    def dispatch-1 [] {
+        each { |c| $c | into binary } | reduce -f $status { |chunk, acc|
+            let acc_bytes = bytes build $acc.bytez $chunk
+            let FRAME = 0x[46 52 41 4d 45]
+            let NEWLINE = 0x[0a]
+
+            mut out_acc = $acc
+            mut cursor = $acc_bytes
+
+            if $acc.kind == 'started' {
+                let nl = $cursor | bytes index-of $NEWLINE
+                if $nl != null {
+                    let sliced = $cursor | bytes at ($nl + 1)..
+
+                    $out_acc = {
+                        kind: 'frame',
+                        bytez: $sliced
+                    }
+
+                    $cursor = $sliced
+                } else {
+                    return {
+                        kind: 'started',
+                        bytez: $cursor
+                    }
+                }
+            } else {
+                $out_acc = {
+                    kind: 'frame',
+                    bytez: $cursor
+                }
+            }
+
+            loop {
+                if not ($out_acc.bytez | bytes starts-with $FRAME) {
+                    if ($out_acc.bytez | is-not-empty) {
+                        # print "did not start with frame" $out_acc.bytez
+                    }
+
+                    break
+                }
+
+                let nl = $out_acc.bytez | bytes index-of $NEWLINE
+                if $nl == -1 { break }
+
+                let after_header = $nl + 1
+                let remaining_len = ($out_acc.bytez | length) - $after_header
+
+                if $remaining_len < $frame_byte_length {
+                    # Not enough for a full frame yet
+                    break
+                }
+
+                let before = $out_acc.bytez | bytes at $after_header..<($after_header + $frame_byte_length)
+                let after = $out_acc.bytez | bytes at ($after_header + $frame_byte_length)..
+
+                # print $"chunked ($before | length) at ($nl)"
+
+                $before | job send $broadcaster --tag $frame_tag
+
+                # Continue stripping the rest
+                $out_acc = {
+                    kind: 'frame',
+                    bytez: $after
+                }
+            }
+
+            return $out_acc
+        } | ignore
+    }
+
+    def dispatch-2 [] {
+        # Skip variable byte header, and group by the frame size plus a FRAME\n prefix
+        # FRAME headers can contain metadata, so far, ffmpeg hasn't emitted any (and if it ever happens we're fucked)
+        let results = skip (ffmpeg-command | bytes index-of 0x[0a] | $in + 1) | chunks ($frame_byte_length + 6) | each -k { |chunk|
+            if ($chunk | length) != ($frame_byte_length + 6) {
+                print "We're fucked (and we were probably fucked before we got to this point)"
+            }
+
+            let frame = $chunk | bytes at 6..
+
+            $frame | job send $broadcaster --tag $frame_tag
+        }
+
+        print ($results | length)
+    }
+
+    def ffmpeg-command [] {
+        ffmpeg -i $filename -loglevel quiet -vf $"trim=start_frame=0:end_frame=($endframe),setpts=PTS-STARTPTS" -f yuv4mpegpipe -pix_fmt yuv420p -
+    }
+
+    # print (ffmpeg-command | take 200)
+
+    ffmpeg-command | dispatch-2
+
+    print "FINISHED BATCHING UP FRAMES"
+
+    # Empty buffer to mark EOF
+    0x[] | job send $broadcaster --tag $frame_tag
+
+    job recv --tag $availability_tag
+
+    for worker in $workers {
+        let payload = {
+            count: 0,
+            tag: $availability_tag,
+            loopback: (job id)
+        }
+
+        $payload | job send $worker --tag $availability_tag
+        job recv --tag $availability_tag
+    }
+
+    print "killing now"
+
+    job kill $broadcaster
+    for worker in $workers {
+        job kill $worker
+    }
+
+    rm $db_path
+
+    mut messages = []
+
+    loop {
+        try {
+            $messages ++= [(job recv --tag $frame_tag --timeout 0sec)]
+        } catch {
+            break
+        }
+    }
+
+    $messages
+}
+
+export def _batched-av1 [
+    filename: string
+    --mod: int = 15
+    --endframe: int = 100
+    --preset: int = 1
+] {
+    let parallelism = 1
+    let meta = vid get-meta $filename
+    let fps = $meta.fps | into int
+    let w = $meta.width
+    let h = $meta.height
+
+    let results = _yuv-split-test $filename --mod $mod --endframe $endframe {
+        let payload = $in
+        let p = mktemp --suffix .ivf
+
+        do $payload.getframes | (SvtAv1EncApp.exe
+            -w $w
+            -h $h
+            --fps $fps
+            --keyint $mod
+            -n $mod
+            --lp $parallelism
+            --preset $preset
+            -i stdin
+            -b $p
+        )
+
+        {
+            index: $payload.index,
+            path: $p
+        }
+    }
+
+    print $results
+
+    $results | sort-by index | each { |result|
+        $"file '($result.path)'\n" | save -a files.txt
+    }
+
+    ffmpeg -probesize 50M -analyzeduration 100M -f concat -safe 0 -i files.txt -c:v copy -y merged.mp4
+
+    rm files.txt ...$results.path
 }
 
 # Defines how much it can overshoot the bitrate assigned - it shouldn't matter for 2-pass, but it does
@@ -403,9 +851,12 @@ export def 'vid 2p av1' [
     --start: string = "0"
     --end: string = "10000000"
     --scd # Setting scd makes svt complain (but it always does)
+    --keyint: int # "Multiple of 32 plus one"; gop size; keyframe interval
     --rm
     --overwrite
     --count
+    --10bit
+    --bin = "SvtAv1EncApp"
 ] {
     def svt-app-2p [
         pass: int
@@ -417,7 +868,7 @@ export def 'vid 2p av1' [
     ] {
         # We can do both passes in one invocation, but I don't know the implications on quality or mem/disk usage. It seems to be fine
         # Just set --passes to 2 (instead of --pass) and pass an output ivf path
-        (SvtAv1EncApp
+        let results = (^$bin
             -i stdin
             --rc $RC_VBR
             --tune $tune
@@ -433,7 +884,16 @@ export def 'vid 2p av1' [
             --pass $pass
             --stats $target_stat
             ...(if $target_ivf != null { [ -b $target_ivf ] } else { [] })
-        ) e>| ignore
+        ) | complete
+
+        if $results.exit_code != 0 {
+            print -e "Svt invocation failure"
+            print -e $results
+
+            error make {
+                msg: "err"
+            }
+        }
     }
 
     if $path =~ '\.min\.' {
@@ -445,16 +905,18 @@ export def 'vid 2p av1' [
 
     # SVT vbr is really good at matching it as long as it's not unreasonable (bitrate for scale, or fast preset)
     # Faster presets (9+) can even be kinda bad and undershoot it by as much as 20%, giving us a 1.2 threshold
-    let fallibility_threshold = if $preset <= 4 { 0.99 } else { 0.98 }
+    let fallibility_threshold = if $tbr != null { 1 } else if $preset <= 4 { 0.99 } else { 0.98 }
 
     let target = path interject $path min --ext mp4 --count=$count
-    # let target = vid get-default-filename $path --ext mp4
-    let target_ivf = vid get-default-filename $path --ext ivf
-    let target_stat = vid get-default-filename $path --ext stat
+    let target_ivf = path interject $target --ext ivf
+    let target_stat = path interject $target --ext stat
     if ($target | path exists) and not ($overwrite or $count) {
         print (ansiwrap yellow $"Skipping ($path | path basename): already compressed")
         return
     }
+
+    # Touch target and use it for subsequent files to avoid collisions
+    touch $target
 
     let meta = vid get-meta $path
     let start_time = parse-time $start
@@ -470,23 +932,21 @@ export def 'vid 2p av1' [
     }) | into int
     let video_bitrate_kbits = ($target_bitrate_bits - $audio_bitrate_bits) / 1000 * $fallibility_threshold | math floor
     let max_res = $max | default (match $video_bitrate_kbits {
-        # "real" bitrate floors:
-        # 200-140kbps for 1080p video, depending on preset and complexity
-        # 120-90kbps for 720p video, depending on preset and complexity
-        # 75-55kbit for 480p video, depending on preset and complexity
+        # "real" bitrate floors: (all depend on preset and complexity of the video)
+        # 200-140kbps for 1080p video
+        # 120-90kbps for 720p video
+        # 75-55kbit for 480p video
         # (... but this is just a heuristic, and I choose the values)
         0..120 => 480,
-        120..300 => 720,
+        120..250 => 720,
         _ => 1080
     })
-    print $max
-    print $max_res
     let scale = vid get-default-scaling $path --max $max_res
 
     # GOP/keyframes; -2 for default of ~5 secs
     # "it is recommended to have keyint be a multiple of 32 + 1 (225 or 257 for instance) to respect the mini-gop structure."
     # I can't speak to its impact on quality, but it seems to measurably improve encode time
-    let keyint = 289
+    let keyint = $keyint | default 289
 
     print $"($scale.max_width):($scale.max_height); ($target_bitrate_bits / 1000)kbit: ($audio_bitrate_bits / 1000) audio, ($video_bitrate_kbits) video; ($keyint) keyint"
 
@@ -494,21 +954,24 @@ export def 'vid 2p av1' [
     # https://gitlab.com/AOMediaCodec/SVT-AV1/-/blob/master/Docs/svt-av1_encoder_user_guide.md
 
     # Pipe for stats.
-    yuv-pipe $path $scale --start $start --end $end | svt-app-2p 1 $meta.fps_ratio $video_bitrate_kbits $keyint $target_stat
+    yuv-pipe --10bit=$10bit $path $scale --start $start --end $end | svt-app-2p 1 $meta.fps_ratio $video_bitrate_kbits $keyint $target_stat
 
     # Second pass (it can't have 3 passes, thankfully, despite what the user guide says)
-    yuv-pipe $path $scale --start $start --end $end | svt-app-2p 2 $meta.fps_ratio $video_bitrate_kbits $keyint $target_stat $target_ivf
+    yuv-pipe --10bit=$10bit $path $scale --start $start --end $end | svt-app-2p 2 $meta.fps_ratio $video_bitrate_kbits $keyint $target_stat $target_ivf
+
+    print $"moving to container..."
+    let include_audio = $audio_bitrate_bits > 0
 
     # Move ivf to new container
     (ffmpeg
         -v warning
         -i $target_ivf
         ...(if $start != "0" or $end != "10000000" { [-ss $start -to $end] } else { [] })
-        -i $path
+        ...(if $include_audio { [-i $path] } else { [] })
         -map 0:v
         -c:v copy
         # We could've done the audio transcode in parallel before, but it's fast enough... maybe as fast as I/O
-        ...(if $audio_bitrate_bits > 0 { [ -map 1:a:0? -c:a libopus -b:a $audio_bitrate_bits -af 'aformat=channel_layouts=stereo|mono' ] } else { [ -an ] })
+        ...(if $include_audio { [ -map 1:a:0? -c:a libopus -b:a $audio_bitrate_bits -af 'aformat=channel_layouts=stereo|mono' ] } else { [ -an ] })
         -y
         $target
     )
@@ -525,46 +988,164 @@ export def 'vid 2p av1' [
 export def 'vid av1 crf' [
     path: path
     --crf: int = 35
-    --video-bitrate = 1.5mb
+    --video-bitrate = 1.5mb # Variable bitrate, maps to --mbr
     --preset(-p): int = 6
-    --audio-bitrate(-a): oneof<filesize, int>
+    --audio-bitrate(-a): oneof<filesize, int> = 96kb
     --max: int # The max dimensions of the smaller side (vertical for landscape, horizontal for portrait)
     --log-level: int = 1 # Set to 3 to print encoder info. SvtApp has useless, irremediable warnings
     --tune: int = 0 # 0: vq, 1: psnr, 2: ssim
     --start: string = "0"
     --end: string = "10000000"
     --scd # Setting scd makes svt complain (but it always does)
+    --10bit
     --rm
     --overwrite
     --count
-
-    # path: path
-    # --crf: int
-    # --preset: int = 6
-    # --audio-bitrate(-a): oneof<filesize, int> = 96kb
-    # --video-bitrate: filesize = 1.5mb # Variable bitrate, maps to --maxrate
-    # --verbosity: string = 'warning'
-    # --bin: string = "ffmpeg"
-    # --start: string = "0"
-    # --end: string = "10000000"
-    # --max: int = 1080
-    # --fps: int
-    # --10bit
-    # --rm
-    # --filter: string
 ] {
+    if $path =~ '\.min\.' {
+        print (ansiwrap yellow $"Skipping ($path | path basename): looks already compressed")
+        return
+    }
+
+    let meta = vid get-meta $path
+
+    let printer = job spawn {
+        mut buffer = ""
+        mut maxlen = 0
+        mut done_printing = false
+        mut last_frames = 0
+        mut last_bitrate = 0
+        # mut last_time = date now
+        mut ema_bitrate = 0
+        # mut ema_fps = 0
+
+        let start_time = date now
+        let regex = '(?x)
+            Encoding:
+            \s*(?<encoded>\d+)\s*
+            /
+            \s*(?<total>-?\d+(?:\.\d+)?)
+            \s*Frames\s*@\s*
+            (?<fps>-?\d+(?:\.\d+)?)\s*
+            (?<fpunit>fp[sm])
+            \s*\|\s*
+            (?<bitratekbps>-?\d+(?:\.\d+)?)
+            \s*kbps\s*\|\s*Time:\s*
+            (?<time>\d+:\d+:\d+)
+            \s*
+            (?<remaining>\[-{0,2}\d+:-?\d+:-?\d+\])?
+            \s*\|\s*Size:\s*
+            (?<size>-?\d+(?:\.\d+)?)
+            \s*(?<sizeunit>[KMG]B)
+            \s*
+            (?<remainingsize>\[[^\[]+\])
+        '
+
+        loop {
+            mut chunk = job recv
+            loop {
+                try {
+                    $chunk ++= job recv --timeout 0sec
+                } catch {
+                    break
+                }
+            }
+
+            $buffer += if (type-is $chunk string) { $chunk } else { $chunk | decode utf-8 }
+
+            loop {
+                let first = $buffer | str replace -r '(\r\n|\r|\n)[\s\S]*' '$1'
+                if $first == $buffer {
+                    break
+                }
+
+                $buffer = $buffer | str substring ($first | str length | $in)..
+
+                let summaried = $first =~ "SUMMARY"
+
+                if ($summaried) {
+                    print ''
+                    $done_printing = true
+                }
+
+                if $done_printing {
+                    break
+                }
+
+                # if ($first !~ 'Encoding') {
+                #     break
+                # }
+
+                let parsed = $first | parse -r $regex | get 0?
+
+                if $parsed == null {
+                    print -en $first
+                } else {
+                    # print ''
+                    # print $parsed
+
+                    let encoded = $parsed.encoded | into int
+                    let elapsed = (date now) - $start_time
+                    let time_per_frame = $elapsed / $encoded
+                    let time_to_finish = $time_per_frame * $meta.frames - $elapsed
+                    let at = $encoded / $meta.fps * 1sec
+
+                    let elapsed_f = vid _format-duration $elapsed --minsections 2 --nomillis
+                    let left_f = vid _format-duration $time_to_finish --minsections 2 --nomillis
+                    let at_f = vid _format-duration $at --minsections 2 --nomillis
+
+                    let new_time = date now
+                    let new_frames = $parsed.encoded | into int
+                    let new_bitrate = $parsed.bitratekbps | into float
+                    let bitrate_update = $new_frames * $new_bitrate - $last_frames * $last_bitrate
+                    # let new_fps = ($new_frames - $last_frames) / (($new_time - $last_time) / 1sec)
+
+                    let a = 1 / 200 # 200 frames
+                    for i in $last_frames..<$new_frames {
+                        $ema_bitrate = $ema_bitrate + $a * ($bitrate_update - $ema_bitrate)
+                        # $ema_fps = $ema_fps + $a * ($new_fps - $ema_fps)
+                    }
+
+                    $last_frames = $new_frames
+                    $last_bitrate = $new_bitrate
+                    # $last_time = $new_time
+
+                    # Parsed size is always in metric megabytes
+                    let size_mib = ($parsed.size | into float) * 1mb / 1mib | math round -p 1
+
+                    mut line = ""
+                    $line += $"Encoded ($parsed.encoded)/($meta.frames) frames @ ($parsed.fps)($parsed.fpunit)"
+                    $line += $" | at ($at_f) / took ($elapsed_f) [($left_f) left]"
+                    $line += $" | ($size_mib)mb \(($new_bitrate | into string -d 1)kbps\) | ($ema_bitrate | into string -d 1)kbps"
+
+                    $maxlen = [$maxlen ($line | str length)] | math max
+
+                    print -en $"\r(str repeat ' ' $maxlen)\r($line)"
+                }
+
+                # let first = ($first
+                #     | str replace -r '\s*-1\s' $"($meta.frames) "
+                #     | str replace -r '\s*\[-{0,2}\d+:-?\d+:-?\d+\]' ''
+                #     | str replace "\r" $"(str repeat ' ' 15)\r"
+                # )
+
+                # print -en $"printer: ($first)"
+            }
+        }
+    }
+
     def svt-app-1p [
         fps_ratio: list
         video_bitrate_kbits: int
         keyint: int
-        target_stat: string
         target_ivf?: string
     ] {
         (SvtAv1EncApp
             -i stdin
             --passes 1
             --tune $tune
-            --progress 0
+            # --progress 0
+            --progress 2
             --crf $crf
             # --lookahead 42 # It warns us if we don't force it to 42
             --scd ($scd | into int)
@@ -574,25 +1155,28 @@ export def 'vid av1 crf' [
             --rc $RC_VBR
             # note: capped crf uses mbr, not tbr
             # set video-bitrate to 0 for uncapped crf, as some videos break the encoder on capped crf
-            ...(if $video_bitrate_kbits > 0 { [-mbr $video_bitrate_kbits ]} else { [] })
+            ...(if $video_bitrate_kbits > 0 { [--mbr $video_bitrate_kbits ]} else { [] })
             --preset $preset
             --keyint $keyint
             ...(if $target_ivf != null { [ -b $target_ivf ] } else { [] })
-        ) #e>| ignore
+        ) e>| each { |chunk|
+            $chunk | job send $printer
+        }
     }
 
     $env.SVT_LOG = $log_level
 
     let target = path interject $path min --ext mp4 --count=$count
-    # let target = vid get-default-filename $path --ext mp4
-    let target_ivf = vid get-default-filename $path --ext ivf
-    let target_stat = vid get-default-filename $path --ext stat
+    let target_ivf = path interject $target --ext ivf
     if ($target | path exists) and not ($overwrite or $count) {
         print (ansiwrap yellow $"Skipping ($path | path basename): already compressed")
         return
     }
 
-    let meta = vid get-meta $path
+    # Touch target and use it for subsequent files to avoid collisions
+    # touch $target
+
+    let stat = ls -D $path | first
     let start_time = parse-time $start
     let end_time = [(parse-time $end), ($meta.duration / 1sec)] | math min
     let duration_s = $end_time - $start_time
@@ -608,9 +1192,31 @@ export def 'vid av1 crf' [
     # I can't speak to its impact on quality, but it seems to measurably improve encode time
     let keyint = 289
 
-    print $"($scale.max_width):($scale.max_height); ($target_bitrate_bits / 1000)kbit: ($audio_bitrate_bits / 1000) audio, ($video_bitrate_kbits) video; ($keyint) keyint"
+    # print $"($scale.max_width):($scale.max_height); ($target_bitrate_bits / 1000)kbit: ($audio_bitrate_bits / 1000) audio, ($video_bitrate_kbits) video; ($keyint) keyint"
 
-    yuv-pipe $path $scale --start $start --end $end | svt-app-1p $meta.fps_ratio $video_bitrate_kbits $keyint $target_stat $target_ivf
+    mut log = $"Encoding (ansiwrap default_reverse ($path | path basename)): from (ansiwrap light_blue ($stat.size | into string))"
+
+    try {
+        let source_meta = vid get-meta $path
+        let res = [$source_meta.width, $source_meta.height] | math min
+
+        $log += $" (ansiwrap light_cyan (vid _format-duration $source_meta.duration)), "
+        # $log += (ansiwrap light_green $"($res)p") + ", "
+        $log += $"(ansiwrap light_green $"($res)p") "
+        $log += (ansiwrap light_green $"($source_meta.fps | math round)fps")
+    }
+
+    print $log
+
+    try {
+        yuv-pipe $path $scale --10bit=$10bit --start $start --end $end --nostats | svt-app-1p $meta.fps_ratio $video_bitrate_kbits $keyint $target_ivf
+    } catch { |e|
+        print -e "Failed or cancelled encode" $e
+
+        rm $target
+
+        return
+    }
 
     # Move ivf to new container
     (ffmpeg
@@ -622,17 +1228,71 @@ export def 'vid av1 crf' [
         -c:v copy
         # We could've done the audio transcode in parallel before, but it's fast enough... maybe as fast as I/O
         ...(if $audio_bitrate_bits > 0 { [ -map 1:a:0? -c:a libopus -b:a $audio_bitrate_bits -af 'aformat=channel_layouts=stereo|mono' ] } else { [ -an ] })
+        -metadata $"comment='Encoded from video of size ($stat.size | into string)'"
         -y
         $target
     )
 
-    let final_size = ls -D $target | first | get size
-    print $"Final size: ($final_size | into string)"
+    let final_stat = ls -D $target | first
+
+    let ret = print-encode-message $stat $final_stat $target
 
     rm $target_ivf
     if $rm {
         rm $path
     }
+
+    job kill $printer
+}
+
+export def 'vid extract-frames' [
+    ...paths
+    --every: int = 1
+    --to = "frames"
+    --from: string
+    --until: string
+    --crop: string
+    --format = "jpg"
+] {
+    rm -rf $to
+    mkdir $to
+
+    mut vf = "select='not(mod(n, " + $"($every)" + "))'"
+    if $crop != null {
+        $vf += $",crop=($crop)"
+    }
+    let chars = seq char a z
+    mut $time_args = []
+    if $from != null {
+        $time_args ++= [-ss $from]
+    }
+
+    if $until != null {
+        $time_args ++= [-to $until]
+    }
+
+    let time_args = $time_args
+    let vf = $vf
+
+    $paths | enumerate | par-each { |pair|
+        let index = $pair.index
+        let path = $pair.item
+        let template = $"($to)/frame%05d($chars | get $index).($format)"
+
+        (ffmpeg
+            -hwaccel cuda
+            ...$time_args
+            # -colorspace bt709
+            # -color_trc bt709
+            # -color_primaries bt709
+            -i $path
+            -vf $vf
+            -fps_mode vfr
+            $template
+        )
+    }
+
+    null
 }
 
 const RC_CRF = 1
@@ -742,18 +1402,178 @@ export def 'vid plot' [
 
 export def 'vid av1-folder' [
     --max: int = 1080
-    --video-bitrate: filesize = 1.5mb
+    --video-bitrate: oneof<closure, filesize> = 1.5mb
     --preset: int
+    --crf: int = 35
 ] {
     let preset = $preset | default-param "vid av1" preset
 
     glob '**/*.{mp4,webm,mkv,avi,m4v,mpg,wmv,mov,flv,m2ts}' | each { |p|
-        vid av1 $p --rm --max $max --video-bitrate $video_bitrate --preset $preset
+        let video_bitrate = if (type-is $video_bitrate closure) {
+            do $video_bitrate (vid get-meta $p)
+        } else {
+            $video_bitrate
+        }
+
+        vid av1 crf $p --rm --max $max --video-bitrate $video_bitrate --preset $preset --crf $crf
     }
 }
 
 export def 'vid av1-folder-2p-crf' [] {
     glob '**/*.{mp4,webm,mkv,avi,m4v,mpg,wmv,mov,flv,m2ts}' | each { |p| vid 2p av1 crf $p --rm }
+}
+
+export def 'vid has-transparency' [
+    path: path
+] {
+    try {
+        # Weed out non-alpha formats inexpensively
+        let probe = ffprobe -v error -select_streams v:0 -show_entries stream=pix_fmt -of default=nw=1 -i $path | complete
+
+        let format = $probe.stdout | parse -r 'pix_fmt=(?<fmt>\w+)' | first
+
+        # alpha formats: rgba, bgra, rgba64be, yuva420p, argb, ya8, pal8 (likely)
+        if $format.fmt? in ['rgb24', rgb48be, 'gbrp', 'yuv420p', 'yuv420p10le', 'yuvj444p', 'yuvj440p', 'yuvj422p', 'yuvj420p', 'gray', 'gray16be'] {
+            return false
+        }
+    }
+
+    # Fully scanning after ffprobe can't confirm non-alpha fmt in case it's encoded with rgba but has no transparent pixels
+    let completion = ffmpeg -i $path -vf 'alphaextract,signalstats,metadata=print' -f null - | complete
+
+    let has_transparency = ($completion.stderr
+        | parse -r 'lavfi.signalstats.YLOW=(?<yuv>\d+)'
+        | any { |match| ($match.yuv | into float) < 255 }
+    )
+
+    return $has_transparency
+}
+
+export def 'vid avif' [
+    path: path
+
+    --crf: int = 22
+    --preset(-p): int = 1 # maps to cpu-used, 0..6
+    --max: int # The max dimensions of the smaller side (vertical for landscape, horizontal for portrait)
+    --tune: int = 0 # 0: vq, 1: psnr, 2: ssim
+    --fmt = "yuv420p10le"
+    --denoiser: int = 0 # 4 is good and reduces file size but sometimes just fails silently
+    --svt # svt will fail for images under 4px, but also for images under 25px (bug?) might also not handle uneven res
+    --parallelism: int
+
+    --rm
+    --overwrite
+    --count
+] {
+    let meta = vid get-meta $path '-count_frames'
+
+    let target_path = path interject $path --ext avif --count=$count
+    if ($target_path | path exists) and not ($overwrite or $count) {
+        print (ansiwrap yellow $"Skipping ($path | path expand | path relative-to ($env.PWD | path expand)): already compressed")
+        return
+    }
+
+    let stat = ls -D $path | first
+    let start_time = date now
+
+    mut log = $"Encoding (ansiwrap default_reverse ($path | path basename)): initial size (ansiwrap light_blue ($stat.size | into string))"
+
+    print $log
+
+    $env.SVT_LOG = 2
+
+    mut svt = $svt
+
+    let has_transparency = vid has-transparency $path
+
+    mut svt_params = ['tune=0']
+    mut aom_params = []
+
+    if $meta.frames == 1 and ($path | path parse | get extension) != 'gif' {
+        $svt_params ++= ['avif=1', 'enable-tpl-la=0']
+    }
+
+    if $denoiser != null and $denoiser > 1 {
+        $svt_params ++= [$'film-grain=($denoiser):film-grain-denoise=1']
+        $aom_params ++= [$'denoise-noise-level=($denoiser)']
+    }
+
+    if $parallelism != null {
+        $svt_params ++= [$'lp=($parallelism)']
+    }
+
+    loop {
+        let wassvt = $svt
+        $svt = false
+
+
+        let transparency_filters = if $has_transparency {
+            [
+                -pix_fmt:0 yuv420p -pix_fmt:1 gray8
+                -filter_complex "[0:v]format=pix_fmts=yuva444p[main]; [main]split[main][alpha]; [main]format=pix_fmts=yuv420p[main]; [alpha]alphaextract[alpha]"
+                -map "[main]:v"
+                -map "[alpha]:v"
+                -c:v:0 (if $wassvt { 'libsvtav1' } else { 'libaom-av1' })
+                -c:v:1 'libaom-av1'
+            ]
+        } else {
+            [
+                -pix_fmt $fmt
+                -vf $"format=($fmt)"
+                -c:v (if $wassvt { 'libsvtav1' } else { 'libaom-av1' })
+            ]
+        }
+
+        print $transparency_filters $wassvt
+
+        try {
+            (ffmpeg
+                -loglevel warning
+                -i $path
+                ...$transparency_filters
+                # -still-picture 1
+                -crf $crf
+                (if $wassvt { '-preset' } else { '-cpu-used' }) $preset
+                ...(if $wassvt {
+                    [-svtav1-params ($svt_params | str join :) ]
+                } else {
+                    [-aom-params ($aom_params | str join :)]
+                })
+                # ...(if $denoiser != null { [-aom-params $'denoise-noise-level=($denoiser)'] } else { [] })
+                -y
+                $target_path
+            )
+
+            break
+        } catch {
+            if not $wassvt {
+                break
+            }
+        }
+    }
+
+    let final_stat = ls -D $target_path | first
+
+    if $final_stat.size == 0b {
+        print -e $"Failed while encoding ($path | path basename)"
+        return
+    }
+
+    let ret = print-encode-message $stat $final_stat $target_path $start_time
+
+    if $rm and $ret.saved > 0kb {
+        rm $path
+    }
+}
+
+export def 'vid avif-folder' [
+    --preset: int = 0
+    --threads: int = 8
+    --crf: int = 25
+    --norm
+] {
+    let rm = not $norm
+    glob '**/*.{png,jpg,jpeg,jfif,gif,webp,heif}' | par-each -t $threads { |p| vid avif $p --preset $preset --crf $crf --rm=$rm --svt } | ignore
 }
 
 export def 'vid folder-duration' [] {
@@ -1035,6 +1855,9 @@ export def 'vid to-gif' [
     } else {
         ""
     }
+    # Using the colorspace filter ONLY for palettegen seems to churn out more accurate results
+    # Currently unused due to some input files having "unknown" color space, which makes mapping impossible
+    let colorspacefilter = "colorspace=all=bt709:trc=srgb:range=pc"
     let palettefilter = $"paletteuse=new=($framepalettes | into int)($dithercommand)"
     let palettegen = $"palettegen=stats_mode=(if $framepalettes { 'single' } else { 'full' })"
 

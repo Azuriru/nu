@@ -7,6 +7,7 @@ export use _forms.nu *
 export use _fs.nu *
 export use _history.nu *
 export use _http.nu *
+export use _jobs.nu *
 export use _mutex.nu *
 export use _ocr.nu *
 export use _path.nu *

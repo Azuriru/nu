@@ -6,21 +6,33 @@ def codegen-question [ question: record<type: string> ] {
     let code = match $question.type {
         # Text fields
         "text" => "
+# Container
+${key}Column = New-Object System.Windows.Forms.FlowLayoutPanel
+${key}Column.Dock = 'Top'
+${key}Column.AutoSize = $true
+${key}Column.FlowDirection = 'TopDown'
+${key}Column.AutoSizeMode = 'GrowAndShrink'
+${key}Column.WrapContents = $false
+${key}Column.Padding = '0,0,0,0'
+${key}Column.Margin  = '0,0,0,0'
+
 # Label
 ${key}Label = New-Object System.Windows.Forms.Label
 ${key}Label.Text = {label_json}
 ${key}Label.AutoSize = $true
-$flowPanel.Controls.Add(${key}Label)
+${key}Column.Controls.Add(${key}Label)
 
 ${key}TextBox = New-Object System.Windows.Forms.TextBox
 {postnew}
-${key}TextBox.Width = 276
+${key}TextBox.Width = {width-276}
 # Enable autocomplete to make ctrl+backspace work
 ${key}TextBox.AutoCompleteMode = 'Append'
 ${key}TextBox.AutoCompleteSource = 'CustomSource'
 ${key}TextBox.Text = {default_json}
 {postinit}
-$flowPanel.Controls.Add(${key}TextBox)
+${key}Column.Controls.Add(${key}TextBox)
+
+$flowPanel.Controls.Add(${key}Column)
 
 if (${autofocus}) {
     $form.Add_Shown({ ${key}TextBox.Select() })
@@ -28,23 +40,35 @@ if (${autofocus}) {
 "
     # Numeric inputs
         "number" => "
+# Container
+${key}Column = New-Object System.Windows.Forms.FlowLayoutPanel
+${key}Column.Dock = 'Top'
+${key}Column.AutoSize = $true
+${key}Column.FlowDirection = 'TopDown'
+${key}Column.AutoSizeMode = 'GrowAndShrink'
+${key}Column.WrapContents = $false
+${key}Column.Padding = '0,0,0,0'
+${key}Column.Margin  = '0,0,0,0'
+
 # Label
 ${key}Label = New-Object System.Windows.Forms.Label
 ${key}Label.Text = {label_json}
 ${key}Label.AutoSize = $true
-$flowPanel.Controls.Add(${key}Label)
+${key}Column.Controls.Add(${key}Label)
 
 {preinit}
 ${key}Numeric = New-Object System.Windows.Forms.NumericUpDown
 {postnew}
-${key}Numeric.Width = 276
+${key}Numeric.Width = {width-276}
 ${key}Numeric.Minimum = {min-null}
 ${key}Numeric.Maximum = {max-null}
 ${key}Numeric.Value   = {default-0}
 ${key}Numeric.Increment = {step-1}
 ${key}Numeric.DecimalPlaces = {decimals-0}
 {postinit}
-$flowPanel.Controls.Add(${key}Numeric)
+${key}Column.Controls.Add(${key}Numeric)
+
+$flowPanel.Controls.Add(${key}Column)
 
 if (${autofocus}) {
     $form.Add_Shown({ ${key}Numeric.Select() })
@@ -87,9 +111,11 @@ if (${autofocus}) {
 ${key}PictureBox = New-Object System.Windows.Forms.PictureBox
 {postnew}
 ${key}PictureBox.Width = 276
+${key}PictureBox.Height = 150
 ${key}PictureBox.ImageLocation = \"$env:TEMP\\modal_preview.jpg\"
 ${key}PictureBox.SizeMode = [System.Windows.Forms.PictureBoxSizeMode]::Zoom
 
+# Better than a FileSystemWatcher, apparently!!
 ${key}PictureTimer = New-Object System.Windows.Forms.Timer
 ${key}PictureTimer.Interval = 120
 ${key}PictureTimer.Add_Tick({
@@ -98,37 +124,22 @@ ${key}PictureTimer.Add_Tick({
 })
 ${key}PictureTimer.Start()
 
-# $watcher = New-Object System.IO.FileSystemWatcher
-# $watcher.Path = Split-Path \"$env:TEMP\\modal_preview.jpg\"
-# $watcher.Filter = (Split-Path \"$env:TEMP\\modal_preview.jpg\" -Leaf)
-# $watcher.EnableRaisingEvents = $true
-# $watcher.IncludeSubdirectories = $false
-# $watcher.NotifyFilter = [IO.NotifyFilters]'LastWrite, FileName, Size'
-
-# $logFile = \"$env:TEMP\\preview_watcher_log.txt\"
-
-# function Write-Log {
-#     param([string]$msg)
-#     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
-#     \"$timestamp`t$msg\" | Out-File -FilePath $logFile -Append -Encoding utf8
-# }
-
-# $onChanged = Register-ObjectEvent -InputObject $watcher -EventName Changed -Action {
-#     Write-Log xxss
-
-#     for ($i = 0; $i -lt 5; $i++) {
-#         ${key}PictureBox.ImageLocation = ${key}PictureBox.ImageLocation
-#         ${key}PictureBox.Refresh()
-#         ${key}PictureBox.Update()
-
-#         Write-Log sleep
-#     }
-
-#     $form.Refresh()
-# }
-
 {postinit}
 $flowPanel.Controls.Add(${key}PictureBox)
+"
+        # Rows
+        "row-start" => "
+$flowPanel = New-Object System.Windows.Forms.FlowLayoutPanel
+$flowPanel.FlowDirection = 'LeftToRight'
+$flowPanel.AutoSize = $true
+$flowPanel.WrapContents = $false
+$flowPanel.Padding = '0,0,0,0'
+$flowPanel.Margin  = '0,0,0,0'
+
+$rootPanel.Controls.Add($flowPanel)
+"
+        "row-end" => "
+$flowPanel = $rootPanel
 "
         _ => {
             error make {
@@ -138,7 +149,7 @@ $flowPanel.Controls.Add(${key}PictureBox)
     }
 
     ($code
-        | str replace -a "{key}" $question.key?
+        | str replace -a "{key}" ($question.key? | default '')
         | str replace -a "{label_json}" ($question.label? | to json)
         | str replace -a "{default_json}" ($question.default? | default "" | to json)
         | str replace -a "{options_jsonb64}" ($question.options? | default [] | to json -r | encode base64 | to json)
@@ -151,13 +162,18 @@ $flowPanel.Controls.Add(${key}PictureBox)
         | str replace -a "{postinit}" ($question.postinit? | default "" | into string)
         | str replace -a "{postnew}" ($question.postnew? | default "" | into string)
         | str replace -a "{preinit}" ($question.preinit? | default "" | into string)
+        | str replace -a "{width-276}" ($question.width? | default "276" | into string)
     )
 }
 
-def codegen-extract [ questions: list<record<key: string>> ] {
+def codegen-extract [ questions: list<record> ] {
     mut code = "[ordered]@{\n"
 
     for question in $questions {
+        if $question.key? == null {
+            continue
+        }
+
         $code += $"    ($question.key) = "
         $code += match $question.type {
             "text" => $"$($question.key)TextBox.Text\n"
@@ -172,13 +188,13 @@ def codegen-extract [ questions: list<record<key: string>> ] {
     $code
 }
 
-def extract-results [ questions: list<record<key: string>>, results: string ] {
+def extract-results [ questions: list<record>, results: string ] {
     let results = $results | from json
     if $results == null {
         return $results
     }
 
-    let qmap = $questions | group-by key
+    let qmap = $questions | where $it has key | group-by key
 
     $results | transpose key value | each { |row|
         let q = $qmap | get -o $row.key
@@ -225,6 +241,8 @@ export def ps-form [
     --options: record
     # --questions: list<record<key: string, label: string, type: string>>
 ] {
+    let questions = $questions | where $it != null
+
     mut code = "
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -242,6 +260,7 @@ $flowPanel.AutoSize = $true
 $flowPanel.FlowDirection = 'TopDown'
 $flowPanel.AutoSizeMode = 'GrowAndShrink'
 $flowPanel.WrapContents = $false
+$rootPanel = $flowPanel
 $form.Controls.Add($flowPanel)
 
 {codegen_questions}
@@ -249,20 +268,22 @@ $form.Controls.Add($flowPanel)
 # Buttons (put inside their own panel to align neatly)
 $buttonPanel = New-Object System.Windows.Forms.FlowLayoutPanel
 $buttonPanel.FlowDirection = 'LeftToRight'
+$buttonPanel.AutoSizeMode = 'GrowAndShrink'
+$buttonPanel.Dock = 'Right'
 $buttonPanel.AutoSize = $true
 $flowPanel.Controls.Add($buttonPanel)
-
-$okButton = New-Object System.Windows.Forms.Button
-$okButton.Text = 'OK'
-$okButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
-$buttonPanel.Controls.Add($okButton)
-$form.AcceptButton = $okButton
 
 $cancelButton = New-Object System.Windows.Forms.Button
 $cancelButton.Text = 'Cancel'
 $cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
 $buttonPanel.Controls.Add($cancelButton)
 $form.CancelButton = $cancelButton
+
+$okButton = New-Object System.Windows.Forms.Button
+$okButton.Text = 'OK'
+$okButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
+$buttonPanel.Controls.Add($okButton)
+$form.AcceptButton = $okButton
 
 $form.Height = $flowPanel.Height + 50
 

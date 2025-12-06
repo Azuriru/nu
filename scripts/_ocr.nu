@@ -115,7 +115,7 @@ export def 'ocr search' [
     } else {
         let dir = mktemp -dt tmpocr.XXXXXXXXXX
 
-        # Surprisingly slow. par-each messes up modified timestamp ordering but we use name order
+        # Surprisingly slow. par-each messes up modified timestamp ordering but ImageGlass uses name order
         let symlink_paths = $filtered | reverse | enumerate | par-each { |pair|
             let expanded = $pair.item.path | path expand
             let prefixed = $"($pair.index | fill -a r -w 4 -c 0).($pair.item.path | path basename)"

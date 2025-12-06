@@ -164,9 +164,10 @@ function Format-Time {
 }
 
 function Map-CaretToUnit {
-    param([pscustomobject]$tokenInfo, [int]$pos)
+    param([pscustomobject]$tokenInfo, [int]$pos, [int]$selLen)
 
-    $rel = $pos - $tokenInfo.Start
+    # Start + length in case the calling code does not guard against non-digit selections; pick the last one
+    $rel = $pos - $tokenInfo.Start + $selLen
     $segIndex = $null
     for ($i=0; $i -lt $tokenInfo.Segments.Count; $i++) {
         $s = $tokenInfo.Segments[$i]

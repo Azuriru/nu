@@ -26,6 +26,17 @@ export def pin-procs [
     powershell.exe ("foreach ($process in Get-Process " + $process + $") { $process.ProcessorAffinity=($procflag) }")
 }
 
+export def pin-procs-loop [
+    process: string
+    procflag: int
+    --interval: duration = 1sec
+] {
+    loop {
+        try { pin-procs $process $procflag }
+        sleep $interval
+    }
+}
+
 # Generate a wrapping command with copied flags as another
 export def "make wrapper" [
     command: string@get-commands

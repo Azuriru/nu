@@ -268,3 +268,15 @@ export def explorer [
         echo 'noexist'
 	}
 }
+
+export def 'list-hashes' [] {
+    glob **/* -D | par-each { |path|
+        let relative = path relative-to $env.PWD
+        let hash = open $path --raw | hash sha256
+
+        {
+            path: $relative,
+            hash: $hash
+        }
+    }
+}

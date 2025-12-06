@@ -4,8 +4,12 @@ export def 'str repeat' [str: string, count: int] {
     '' | fill -w $count -c $str
 }
 
+def ansi-list [] {
+    ansi -l | get name
+}
+
 export def 'ansiwrap' [
-    code: string
+    code: string@ansi-list
     text: any
 ] {
     $"(ansi $code)($text | to text)(ansi reset)"

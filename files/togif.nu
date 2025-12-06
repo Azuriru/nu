@@ -9,6 +9,7 @@ const CURRENT_PATH = path self
 let arrow_code = open ($CURRENT_PATH | path dirname | path join timecb.ps1)
 
 def update-screencap [ path: string, time: string, preview_path: string ] {
+    # NOTE: for -ss, this will include the captured frame. For -to, it will **not**
     ffmpeg -ss $time -i $path -frames:v 1 -update 1 -y $preview_path o+e>| ignore
 }
 
@@ -48,12 +49,14 @@ def main [ file: string ] {
     let metas = $paths.value | par-each { |path| vid get-meta $path }
     let max_duration = $metas.duration | math max
 
-    let formatted_duration = vid _format-duration $max_duration --trim --optmillis
+    let formatted_duration = vid _format-duration $max_duration
 
     let watcher_id = job spawn {
         watch -q $timecode_path | reduce -f null { |_, last|
             try {
-                let timecode = open $timecode_path | decode utf-8 | str trim
+                let lines = open $timecode_path | decode utf-8 | lines | str trim
+                let timecode = $lines.0?
+                let path = $lines.1?
 
                 if $timecode == $last {
                     return $last
@@ -75,12 +78,17 @@ def main [ file: string ] {
     let responses = (ps-form
         --title "Video to gif"
         --options {
-            preinit: $"$VIDEO_END = '($formatted_duration)'"
+            preinit: $'$VIDEO_END = "($formatted_duration)"; $VIDEO_PATH = "($paths.0.value)";'
         }
         --questions [
+            (if ($paths | length) == 1 {
+                {
+                    key: 'preview',
+                    type: 'picture'
+                }
+            }),
             {
-                key: 'preview',
-                type: 'picture'
+                type: 'row-start'
             },
             {
                 key: 'start',
@@ -88,6 +96,7 @@ def main [ file: string ] {
                 label: 'Start time',
                 default: ($defaults.start? | default '0:00'),
                 autofocus: true,
+                width: 134,
                 postinit: ($arrow_code | str replace -a "__key__" "start")
             },
             {
@@ -95,7 +104,11 @@ def main [ file: string ] {
                 type: 'text',
                 label: 'End time',
                 default: ($defaults.end? | default $formatted_duration), # '1:00:00'
+                width: 134,
                 postinit: ($arrow_code | str replace -a "__key__" "end")
+            },
+            {
+                type: 'row-end'
             },
             {
                 key: 'palette',
