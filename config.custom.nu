@@ -6,13 +6,14 @@ use scripts/mod.nu *
 let normal_pwd = ($env.PWD | str downcase)
 let redirect_pwds = [
     ($env.windir | path join System32 | str downcase),
+    ($env.USERPROFILE | str downcase),
     ($env.USERPROFILE | path join .cargo bin | str downcase)
 ]
 
 let next_pwd = if $normal_pwd in $redirect_pwds {
-	'~/Code'
+    $env.USERPROFILE | path join Code
 } else {
-	'.'
+    $env.PWD
 }
 
 cd $next_pwd
@@ -23,7 +24,7 @@ $env.PROMPT_COMMAND_RIGHT = { || "" }
 $env.config.show_banner = false
 $env.config.rm.always_trash = true
 
-$env.config.history.file_format = 'sqlite'
+# $env.config.history.file_format = 'sqlite'
 
 $env.config.ls.clickable_links = false
 
