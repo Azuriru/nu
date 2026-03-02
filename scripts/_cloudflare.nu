@@ -14,6 +14,7 @@ const INSERT_CAPTURE_STMT = "
 
 export def cloudflare [ port ] {
     try {
+        # TODO: Why try?
         stor open | query db $CREATE_CAPTURE_STMT
     }
 

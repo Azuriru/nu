@@ -75,6 +75,104 @@ export def greplink [
     } | ignore
 }
 
+
+const CREATE_FILE_HASHES = "
+    CREATE TABLE IF NOT EXISTS file_hashes (
+        file_path TEXT PRIMARY KEY,
+        file_size INTEGER NOT NULL,
+        hash_hex STRING
+    )
+"
+
+# REPLACE INTO but with manual null coalescing
+const INSERT_FILE_HASHES = "
+    INSERT INTO file_hashes (file_path, file_size, hash_hex)
+    VALUES (?, ?, ?)
+    ON CONFLICT(file_path) DO UPDATE SET
+        file_size = COALESCE(excluded.file_size, file_hashes.file_size),
+        hash_hex = COALESCE(excluded.hash_hex, file_hashes.hash_hex);
+"
+const SELECT_FILE_SIZE_COLLISIONS = "
+    SELECT
+        COUNT(*) AS countitude,
+        file_size
+    FROM file_hashes
+    GROUP BY file_size
+    HAVING countitude > 1
+"
+const SELECT_FILE_HASHES_BY_SIZE = "
+    SELECT *
+    FROM file_hashes
+    WHERE file_size = ?
+"
+const SELECT_FILE_HASHES = "
+    SELECT * FROM file_hashes
+"
+const SELECT_HASH_COLLISIONS = "
+    SELECT
+        COUNT(*) AS countitude,
+        hash_hex
+    FROM file_hashes
+    WHERE hash_hex IS NOT NULL
+    GROUP BY hash_hex
+    HAVING countitude > 1
+"
+
+export def scan-file-hashes [
+    glob: string = '**/*'
+    --noexpand
+] {
+    stor open | query db $CREATE_FILE_HASHES
+
+    # note: par-each can data race in-memory sqlite dbs
+    # so like, be careful (?)
+    let count = glob $glob -DS | par-each { |p|
+        let p = if $noexpand { $p } else { $p | path expand }
+        let meta = ls -D $p | first
+
+        # null does not override existing hash
+        stor open | query db $INSERT_FILE_HASHES -p [$p $meta.size null]
+    } | length
+
+    print -e $"added: ($count) files to scan list \(run fill-file-hashes to sieve)"
+}
+
+export def fill-file-hashes [] {
+    stor open | query db $SELECT_FILE_SIZE_COLLISIONS | each { |row|
+        let files = stor open | query db $SELECT_FILE_HASHES_BY_SIZE -p [$row.file_size]
+
+        print -e $"file size collision group with length: ($files | length), size: ($row.file_size * 1b)"
+
+        $files | each { |row|
+            print -e $"file path: ($row.file_path)"
+        }
+
+        $files | each { |row|
+            if $row.hash_hex != null {
+                print -e $"hash was already computed: ($row.hash_hex)"
+                return
+            }
+
+            # cat is probably faster
+            let hash = open $row.file_path --raw | hash sha256
+
+            print -e $"computed hash: ($hash)"
+
+            stor open | query db $INSERT_FILE_HASHES -p [$row.file_path $row.file_size $hash]
+        }
+    }
+
+    let duplicate_hashes = stor open | query db $SELECT_HASH_COLLISIONS | get hash_hex
+
+    (stor open
+        | query db $SELECT_FILE_HASHES
+        | where { |row| $row.hash_hex in $duplicate_hashes }
+        | group-by hash_hex
+        | update cells { reject hash_hex }
+        | values
+    )
+}
+
 export def newest-file [] {
     ls | sort-by modified -r | first | get name
 }
@@ -108,19 +206,61 @@ export def fix-image-extensions [] {
 export def ml [
     source: path, # The path the symlink will live at
     target: path # The path the symlink will point to
+    --force(-f)
+    --clobber
 ] {
     let source_path = $source | path expand
     let target_path = $target | path expand
+
+    mut dont_copy_meta = true
+    mut rm_before_mklink = false
+
+    if ($source_path | path exists -n) {
+        if not $clobber {
+            error make {
+                msg: (
+                    "Source path exists. Make sure the symlink is the first argument, and the target is the second.\n"
+                    + "If you want to overwrite a source path, use --clobber"
+                ),
+                label: {
+                    text: 'this path',
+                    span: (metadata $source).span
+                }
+            }
+        } else {
+            $rm_before_mklink = true
+        }
+    }
+
     let target_stat = try {
-        ls -D $target | first
+        let stat = ls -D $target | first
+
+        $dont_copy_meta = false
+
+        $stat
     } catch {
-        error make {
-            msg: 'Target does not exist. Make sure the symlink is the first argument, and the target is the second',
-            label: {
-                text: 'this path',
-                span: (metadata $target).span
+        if $force {
+            # Let's make it up as we go
+            {
+                type: 'file'
+            }
+        } else {
+            error make {
+                msg: (
+                    "Target does not exist. Make sure the symlink is the first argument, and the target is the second.\n"
+                    + "If a non-existent target is desired, use --force"
+                ),
+                label: {
+                    text: 'this path',
+                    span: (metadata $target).span
+                }
             }
         }
+    }
+
+    if $rm_before_mklink {
+        # rm doesn't seem to follow symlinks
+        rm $source
     }
 
     if $target_stat.type == 'dir' {
@@ -129,7 +269,9 @@ export def ml [
         mklink $'"($source)"' $'"($target)"'
     }
 
-    touch $source -c -s -r $target
+    if not $dont_copy_meta {
+        touch $source -c -s -r $target
+    }
 }
 
 export def make-tl-fold [ folder: path ] {
@@ -162,7 +304,7 @@ export def make-tl-fold [ folder: path ] {
         let resolved = $file | path expand
         let dir_base = $resolved | path dirname | path basename
 
-        if $dir_base == 'kks-scene' {
+        if $dir_base =~ '-scene' {
             ml $"./.edits/($base)" $resolved
         }
     } | ignore
@@ -278,5 +420,66 @@ export def 'list-hashes' [] {
             path: $relative,
             hash: $hash
         }
+    }
+}
+
+export def "du-native" [] {
+    ^du -ab | lines | parse -r '(?<bytes>\d+)\s+(?<path>.+)' | update bytes { into int | $in * 1b }
+}
+
+export def "ls-recursive-native" [] {
+    ^ls -R | lines | generate { |line, state = { ready: true, path: null }|
+        if $state.ready == true {
+            return {
+                out: null,
+                next: {
+                    ready: false,
+                    path: ($line | parse -r '(?<path>.+):' | first | get path)
+                }
+            }
+        }
+
+        if $line == '' {
+            return {
+                out: null,
+                next: {
+                    ready: true,
+                    path: null
+                }
+            }
+        }
+
+        return {
+            out: ($state.path | path join $line),
+            next: $state
+        }
+    } | where $it != null
+}
+
+export def find-all-files [] {
+    ^'C:\Program Files\Git\usr\bin\find.exe' . -type f | lines
+}
+
+export def cp-symlinks [
+    from: string
+    to: string
+    --force
+] {
+    let from_abs = $from | path expand
+    let to_abs = $to | path expand
+
+    let symlinks = do {
+        cd $from_abs
+
+        ls **/* -l | where type == symlink | sort-by modified | select name target
+    }
+
+    print $symlinks
+
+    # This copies folders, so always make the folder
+    mkdir $to
+
+    $symlinks | each { |sym|
+        ml ($to | path join $sym.name) $sym.target --force=$force
     }
 }

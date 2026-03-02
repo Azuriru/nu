@@ -230,3 +230,36 @@ function Update-CaretSelection {
     $textBox.SelectionStart = $selStart
     $textBox.SelectionLength = $selLen
 }
+
+function Update-TimeCapture {
+    param($timecode)
+
+    $cropv = if ($cropTextBox -ne $null) {
+        $cropTextBox.Text
+    } else {
+        ""
+    }
+
+    $extra = [ordered]@{
+        timecode = $timecode
+        path = $VIDEO_PATH
+        crop = $cropv
+    }
+    $extrajson = $extra | ConvertTo-Json -Compress
+
+    "$timecode`n$extrajson" | Out-File -FilePath $env:TEMP\modal_timecode.txt
+
+    try {
+        $previewPictureBox.ImageLocation = $previewPictureBox.ImageLocation
+    } catch {}
+}
+
+$logFile = "$env:TEMP\powershell_forms_log.txt"
+
+function Write-Log {
+    param([string]$msg)
+
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
+
+    "$timestamp`t$msg" | Out-File -FilePath $logFile -Append -Encoding utf8
+}

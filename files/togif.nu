@@ -8,9 +8,19 @@ const CURRENT_PATH = path self
 # Attach on postinit so TextChanged doesn't fire when initializing the default value
 let arrow_code = open ($CURRENT_PATH | path dirname | path join timecb.ps1)
 
-def update-screencap [ path: string, time: string, preview_path: string ] {
+def update-screencap [
+    path: string,
+    time: string,
+    preview_path: string,
+    --crop: string
+] {
     # NOTE: for -ss, this will include the captured frame. For -to, it will **not**
-    ffmpeg -ss $time -i $path -frames:v 1 -update 1 -y $preview_path o+e>| ignore
+    let vfargs = if $crop != null {
+        [-vf $"crop=($crop)"]
+    } else {
+        []
+    }
+    ffmpeg -ss $time -i $path -frames:v 1 -update 1 ...$vfargs -y $preview_path o+e>| ignore
 }
 
 def main [ file: string ] {
@@ -20,9 +30,9 @@ def main [ file: string ] {
         return
     }
 
-    let db_path = $nu.temp-path | path join togif.db
-    let timecode_path = $nu.temp-path | path join modal_timecode.txt
-    let preview_path = $nu.temp-path | path join modal_preview.jpg
+    let db_path = $nu.temp-dir | path join togif.db
+    let timecode_path = $nu.temp-dir | path join modal_timecode.txt
+    let preview_path = $nu.temp-dir | path join modal_preview.jpg
 
     touch $timecode_path
     sqlite init $db_path [
@@ -43,29 +53,45 @@ def main [ file: string ] {
     }
 
     if ($paths | length) == 1 {
-        update-screencap $paths.0.value ($defaults.start? | default 0 | into string) $preview_path
+        update-screencap $paths.0.value ($defaults.start? | default 0 | into string) $preview_path --crop $defaults.crop?
     }
 
     let metas = $paths.value | par-each { |path| vid get-meta $path }
     let max_duration = $metas.duration | math max
+
+    let max_width = $metas.width | math max
+    let max_height = $metas.height | math max
 
     let formatted_duration = vid _format-duration $max_duration
 
     let watcher_id = job spawn {
         watch -q $timecode_path | reduce -f null { |_, last|
             try {
-                let lines = open $timecode_path | decode utf-8 | lines | str trim
+                let rawf = open $timecode_path | decode utf-8
+                let lines = $rawf | lines | str trim
                 let timecode = $lines.0?
-                let path = $lines.1?
+                mut extra = null
 
-                if $timecode == $last {
+                try {
+                    $extra = $lines.1 | from json
+                }
+
+                # print $"raw: ($rawf)"
+
+                if $timecode == null {
                     return $last
                 }
 
-                print $timecode
-                update-screencap $paths.0.value $timecode $preview_path
+                # Nushell doesn't have referential equality?
+                if [$timecode $extra] == $last {
+                    return $last
+                }
 
-                return $timecode
+                print $"time: ($timecode)"
+
+                update-screencap $paths.0.value $timecode $preview_path --crop $extra.crop?
+
+                return [$timecode $extra]
             } catch { |e|
                 print -e $e
 
@@ -78,13 +104,136 @@ def main [ file: string ] {
     let responses = (ps-form
         --title "Video to gif"
         --options {
-            preinit: $'$VIDEO_END = "($formatted_duration)"; $VIDEO_PATH = "($paths.0.value)";'
+            preinit: $'$VIDEO_END = "($formatted_duration)"; $VIDEO_PATH = "($paths.0.value)";',
+            globals: {
+                VIDEO_WIDTH: $max_width,
+                VIDEO_HEIGHT: $max_height,
+            }
         }
         --questions [
             (if ($paths | length) == 1 {
                 {
                     key: 'preview',
-                    type: 'picture'
+                    type: 'picture',
+                    postinit: `
+
+$previewPictureBox.BackColor = [System.Drawing.Color]::Black
+# $previewPictureBox.Width = [Math]::min(276, $previewPictureBox.Height * $VIDEO_HEIGHT / $VIDEO_WIDTH)
+
+$startCoord = $null
+$endCoord = $null
+
+$previewPictureBox.Add_Paint({
+    param($sender, $e)
+
+    if ($startCoord -eq $null -or $endCoord -eq $null) {
+        return
+    }
+
+    $minx = [Math]::min($startCoord.X, $endCoord.X)
+    $maxx = [Math]::max($startCoord.X, $endCoord.X)
+    $miny = [Math]::min($startCoord.Y, $endCoord.Y)
+    $maxy = [Math]::max($startCoord.Y, $endCoord.Y)
+    $dx = $maxx - $minx
+    $dy = $maxy - $miny
+
+    $g = $e.Graphics
+
+    $translucentColor = [System.Drawing.Color]::FromArgb(75, 255, 255, 255) # Semi-transparent black
+
+    $translucentBrush = New-Object System.Drawing.SolidBrush($translucentColor)
+
+    $rect = New-Object System.Drawing.Rectangle($minx, $miny, $dx, $dy)
+
+    $g.FillRectangle($translucentBrush, $rect)
+
+    $translucentBrush.Dispose()
+})
+
+$previewPictureBox.Add_MouseDown({
+    param($sender, $e)
+
+    $script:startCoord = $e.Location
+
+    Write-Log "down $($e.Location) $($previewPictureBox.Width) $($previewPictureBox.Height)"
+})
+
+$previewPictureBox.Add_MouseMove({
+    param($sender, $e)
+
+    $script:endCoord = $e.Location
+})
+
+$previewPictureBox.Add_MouseUp({
+    param($sender, $e)
+
+    if ($startCoord -eq $null) {
+        return
+    }
+
+    $endCoord = $e.Location
+
+    $pictureWidth = $previewPictureBox.Width
+    $pictureHeight = $previewPictureBox.Height
+    $offsetLeft = 0
+    $offsetRight = 0
+
+    if ($previewPictureBox.Image -ne $null) {
+        $imageWidth = $previewPictureBox.Image.Width
+        $imageHeight = $previewPictureBox.Image.Height
+
+        # Calculate the smallest ratio to fit, then center it
+        $widthRatio = $pictureWidth / $imageWidth
+        $heightRatio = $pictureHeight / $imageHeight
+        $scaleFactor = [Math]::Min($widthRatio, $heightRatio)
+
+        $displayedWidth = [Math]::Round($imageWidth * $scaleFactor)
+        $displayedHeight = [Math]::Round($imageHeight * $scaleFactor)
+
+        # Overrides
+        $offsetLeft = [Math]::Round(($pictureWidth - $displayedWidth) / 2)
+        $offsetTop = [Math]::Round(($pictureHeight - $displayedHeight) / 2)
+        $pictureWidth = $displayedWidth
+        $pictureHeight = $displayedHeight
+    }
+
+    $minx = [Math]::min($startCoord.X - $offsetLeft, $endCoord.X - $offsetLeft)
+    $maxx = [Math]::max($startCoord.X - $offsetLeft, $endCoord.X - $offsetLeft)
+    $miny = [Math]::min($startCoord.Y - $offsetTop, $endCoord.Y - $offsetTop)
+    $maxy = [Math]::max($startCoord.Y - $offsetTop, $endCoord.Y - $offsetTop)
+
+    # Clamp when near the edges
+    if ($minx -le 10) { $minx = 0 }
+    if ($miny -le 10) { $miny = 0 }
+    if ($maxx -gt ($pictureWidth - 10)) { $maxx = $pictureWidth }
+    if ($maxy -gt ($pictureHeight - 10)) { $maxy = $pictureHeight }
+
+    $dx = $maxx - $minx
+    $dy = $maxy - $miny
+    $top = $miny / $pictureHeight * $VIDEO_HEIGHT
+    $left = $minx / $pictureWidth * $VIDEO_WIDTH
+    $width = $dx / $pictureWidth * $VIDEO_WIDTH
+    $height = $dy / $pictureHeight * $VIDEO_HEIGHT
+
+    # Single clicks should reset the scaling
+    if ($dx -eq 0 -or $dy -eq 0) {
+        $top = 0
+        $left = 0
+        $width = $VIDEO_WIDTH
+        $height = $VIDEO_HEIGHT
+    }
+
+    $top = [Math]::max($top, 0)
+    $left = [Math]::max($left, 0)
+    $width = [Math]::min($VIDEO_WIDTH - $left, $width)
+    $height = [Math]::min($VIDEO_HEIGHT - $top, $height)
+
+    $script:startCoord = $null
+    $script:endCoord = $null
+
+    $cropTextBox.Text = "$([Math]::round($width)):$([Math]::round($height)):$([Math]::round($left)):$([Math]::round($top))"
+})
+                    `
                 }
             }),
             {
@@ -153,6 +302,19 @@ def main [ file: string ] {
                 label: 'Max res',
                 default: ($defaults.maxres? | default 512),
                 max: (1080 * 8)
+            },
+            {
+                key: 'crop',
+                type: 'text',
+                label: 'Crop (w:h:x:y)',
+                default: ($defaults.crop? | default $'($max_width):($max_height):0:0'),
+                postinit: '
+$cropTextBox.Add_TextChanged({
+    param($sender, $e)
+
+    Update-TimeCapture $startTextBox.Text
+})
+'
             }
         ]
     )
@@ -169,6 +331,7 @@ def main [ file: string ] {
     open $db_path | query db "REPLACE INTO key_values (key, value) VALUES (?, ?)" -p ['dithering', $responses.dithering_index]
     open $db_path | query db "REPLACE INTO key_values (key, value) VALUES (?, ?)" -p ['loops', $responses.loops]
     open $db_path | query db "REPLACE INTO key_values (key, value) VALUES (?, ?)" -p ['maxres', $responses.maxres]
+    open $db_path | query db "REPLACE INTO key_values (key, value) VALUES (?, ?)" -p ['crop', $responses.crop]
 
     for path in $paths.value {
         open $db_path | query db "REPLACE INTO key_values (key, value) VALUES (?, ?)" -p ['path', $path]
@@ -180,6 +343,7 @@ def main [ file: string ] {
             --loops $responses.loops
             --framepalettes=($responses.palette != 'global')
             --dither $responses.dithering
+            --crop $responses.crop
         )
     }
 }
