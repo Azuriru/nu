@@ -1,6 +1,9 @@
 alias core-mv = mv
 alias mv = mv -n
 
+alias core-cp = cp
+alias cp = cp -n
+
 # Cargo aliases
 alias crun = cargo run --
 alias crunrelease = cargo run --release --

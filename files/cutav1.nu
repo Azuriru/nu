@@ -22,21 +22,21 @@ def update-screencap [ path: string, time: string, preview_path: string ] {
 # | 11 | 0.993777 | 1m 8.8s   | 145 |
 # | 10 | 0.993774 | 1m 9.5s   | 143 | 2-pass 1080p runtime plateau (~500fps 1st + ~200fps 2nd)
 # |  9 | 0.994713 | 1m 26.1s  | 114 | Significantly reduced spurious blocking
-# |  8 | 0.995800 | 2m 13.0s  | 74  | Starts matching precise target birate (250fps 1st pass)
+# |  8 | 0.995800 | 2m 13.0s  | 74  | Starts matching precise target birate (250fps 1st pass), solid and quick
 # |  7 | 0.996164 | 3m 1.8s   | 54  |
-# |  6 | 0.996476 | 4m 31.5s  | 36  |
+# |  6 | 0.996476 | 4m 31.5s  | 36  | 5-6 are my preferred middlegrounds
 # |  5 | 0.996712 | 6m 3.1s   | 27  |
-# |  4 | 0.996923 | 9m 26.7s  | 17  | Good threshold for low bitrates and lower resolutions
+# |  4 | 0.996923 | 9m 26.7s  | 17  | Good threshold for low bitrates and lower resolutions, slowest I'd go at 1080p
 # |  3 | 0.997030 | 17m 42.3s | 9.3 |
 # |  2 | 0.997160 | 37m 13.5s | 4.4 |
-# |  1 | 0.997313 | 75m 22.4s | 2.1 | Probably as low as you want to go (at higher resolutions), but...
+# |  1 | 0.997313 | 75m 22.4s | 2.1 | Probably as low as you want to go (at lower resolutions), but...
 # |  0 | 0.997390 | 196m 54s  | 0.8 | preset 0 can still improve color accuracy and moving shapes
 def main [ file: string ] {
     let paths = collate $file --wait 150ms --interval 55ms | sort-by value -i
 
-    let db_path = $nu.temp-path | path join cutav1.db
-    let timecode_path = $nu.temp-path | path join modal_timecode.txt
-    let preview_path = $nu.temp-path | path join modal_preview.jpg
+    let db_path = $nu.temp-dir | path join cutav1.db
+    let timecode_path = $nu.temp-dir | path join modal_timecode.txt
+    let preview_path = $nu.temp-dir | path join modal_preview.jpg
 
     sqlite init $db_path [
         "
@@ -218,6 +218,6 @@ def main [ file: string ] {
     for path in $paths.value {
         open $db_path | query db "REPLACE INTO key_values (key, value) VALUES (?, ?)" -p ['path', ($path | path expand)]
 
-        vid 2p av1 $path $size --start $start --end $end --preset $preset --count --max $maxres --keyint $keyint
+        vid 2p av1 $path $size --start $start --end $end --preset $preset --count --max $maxres --keyint $keyint --ignoremin
     }
 }

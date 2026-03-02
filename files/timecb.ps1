@@ -53,11 +53,7 @@ $__key__TextBox.Add_MouseWheel({
 $__key__TextBox.Add_TextChanged({
     param($sender, $e)
 
-    "$($__key__TextBox.Text)`n$VIDEO_PATH" | Out-File -FilePath $env:TEMP\modal_timecode.txt
-
-    try {
-        $previewPictureBox.ImageLocation = $previewPictureBox.ImageLocation
-    } catch {}
+    Update-TimeCapture $__key__TextBox.Text
 })
 
 $__key__TextBox.Add_KeyDown({

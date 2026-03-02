@@ -16,3 +16,4 @@ export use _ssh.nu *
 export use _str.nu *
 export use _term.nu *
 export use _vid.nu *
+export use _zip.nu *

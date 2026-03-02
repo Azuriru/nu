@@ -154,7 +154,7 @@ export def map-with-last [
 
 export def collate [
     append
-    --db: path = ($nu.temp-path | path join collated.db)
+    --db: path = ($nu.temp-dir | path join collated.db)
     --wait: duration = 1sec
     --interval: duration = 0.1sec
 ] {

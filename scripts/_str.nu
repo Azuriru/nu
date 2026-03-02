@@ -15,6 +15,10 @@ export def 'ansiwrap' [
     $"(ansi $code)($text | to text)(ansi reset)"
 }
 
+export def 'ansi demo' [] {
+    ansi -l
+}
+
 export def sanitize-nu-clipboard [] {
     bp | lines | each { |line| $line | str replace -a "\t" "    " } | str join "\r\n" | bp
 }

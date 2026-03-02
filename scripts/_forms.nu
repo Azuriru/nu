@@ -297,8 +297,16 @@ if ($result -eq [System.Windows.Forms.DialogResult]::OK)
 }
     "
 
+    mut preinit = $options.preinit? | default "" | into string
+
+    if $options.globals? != null {
+        let decls = $options.globals | transpose k v | each { |row| $"$($row.k) = ($row.v)" } | str join "\n"
+
+        $preinit = $"($decls)\n($preinit)"
+    }
+
     $code = ($code
-        | str replace -a "{preinit}" ($options.preinit? | default "" | into string)
+        | str replace -a "{preinit}" $preinit
         | str replace -a "{title_json}" ($title | to json)
         | str replace -a "{codegen_questions}" ($questions | each { |q| codegen-question $q } | str join "\n")
         | str replace -a "{codegen_extract}" (codegen-extract $questions)
@@ -306,7 +314,7 @@ if ($result -eq [System.Windows.Forms.DialogResult]::OK)
 
     # print $code
 
-    let ps1_path = $nu.temp-path | path join "ps-form.ps1"
+    let ps1_path = $nu.temp-dir | path join "ps-form.ps1"
     $code | save -f $ps1_path
 
     # let result = powershell -Command $code

@@ -89,3 +89,58 @@ export def 'job pool free' [] {
 
     return $available | get loopback
 }
+
+# Stolem: https://discord.com/channels/601130461678272522/615253963645911060/1426978963242356896
+#
+# Returns all messages in the mailbox as a stream
+#
+# After the mailbox is emptied, continues to wait for
+# more messages and returns them as part of the stream.
+#
+# If `--timeout` is specified, the stream will stop
+# after not receiving any new messages for `$timeout`.
+#
+# The stream can be prematurely ended with the usual methods,
+# ie using `first`, `take`, `take while` and other similar
+# commands.
+@example "Collect all the messages in the mailbox and stop." {
+    let messages = job recv-all --timeout 0sec
+}
+export def 'job recv-all' [
+    --tag: int # A tag for the messages
+    --timeout: duration # The maximum time duration to wait for
+    --stop-sentinel: any
+]: [ nothing -> list<any> ] {
+    # discard pipeline input just incase
+    null
+
+    generate {|e = null|
+        let out = match {tag: $tag, timeout: $timeout} {
+            {tag: null, timeout: null} => { job recv }
+            {$tag, timeout: null} => { job recv --tag=$tag }
+            {$tag, $timeout} => {
+                try {
+                    if $tag == null {
+                        job recv --timeout=$timeout
+                    } else {
+                        job recv --timeout=$timeout --tag=$tag
+                    }
+                } catch {|err|
+                    if $err.json has "recv_timeout" {
+                        # stop stream
+                        return {}
+                    } else {
+                        # rethrow error
+                        return $err.raw
+                    }
+                }
+            }
+        }
+
+        if $out == $stop_sentinel {
+            { }
+        } else {
+            { out: $out, next: null }
+        }
+    }
+}
